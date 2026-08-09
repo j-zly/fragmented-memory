@@ -38,6 +38,19 @@ REDIS_PASSWORD = os.environ.get("KEEPSAKE_REDIS_PASSWORD")
 if not REDIS_PASSWORD:
     REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD")
 
+# 回退：从 Keepsake 配置读取 Redis 连接（cron 环境通常没有环境变量）
+if REDIS_HOST == "127.0.0.1":
+    try:
+        _cfg_path = os.path.expanduser("~/.config/keepsake/config.json")
+        if os.path.exists(_cfg_path):
+            import json as _json
+            _cfg = _json.load(open(_cfg_path))
+            REDIS_HOST = _cfg.get("redis_host", REDIS_HOST)
+            REDIS_PORT = int(_cfg.get("redis_port", REDIS_PORT))
+            REDIS_PASSWORD = _cfg.get("redis_password") or REDIS_PASSWORD
+    except Exception:
+        pass
+
 # 同义词表 key
 SYNONYM_KEY = "keepsake:synonyms"
 
