@@ -23,6 +23,8 @@ _MODEL_DIMENSIONS: dict[str, int] = {
     # DashScope
     "text-embedding-v2": 1536,
     "text-embedding-v3": 1024,
+    # 本地 ollama
+    "nomic-embed-text": 768,
 }
 
 _DEFAULT_DIM = 1536

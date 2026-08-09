@@ -156,6 +156,9 @@ class RedisStorage:
         entity_cooc_min_count: int = 2,
     ):
         self._embedder = embedder
+        # 加固: embedder 存在时优先用它的真实维度，防止调用方漏传 embed_dim 建错索引
+        if embedder is not None:
+            embed_dim = embedder.dimension
         self._host = host
         self._port = port
         self._password = password
@@ -998,14 +1001,18 @@ class RedisStorage:
         effective_agent_id = agent_id if agent_id else self._agent_id
         effective_is_primary = is_primary if is_primary is not None else self._is_primary
 
-        # BM25 全文搜索（默认）
+        # 双路融合检索（v1.2）: BM25 全文 + KNN 语义并行，合并去重后返回
+        # BM25 结果在前（关键词精确命中高置信），KNN 补充语义召回
         results = self.search_bm25(query, tag_filter, effective_agent_id, effective_is_primary)
-        if results:
-            return results
 
-        # 无结果时尝试 KNN 向量搜索（如果 embedder 可用）
         if self._has_embedder():
-            results = self.search_knn(query, tag_filter, effective_agent_id, effective_is_primary)
+            knn_results = self.search_knn(query, tag_filter, effective_agent_id, effective_is_primary)
+            if knn_results:
+                seen = {r.get("content") for r in results if r.get("content")}
+                knn_only = [r for r in knn_results if r.get("content") not in seen]
+                if knn_only:
+                    # KNN 补充召回排在 BM25 之后，按 final_limit 截断
+                    results = (results + knn_only)[: self._final_limit]
 
         return results
 
