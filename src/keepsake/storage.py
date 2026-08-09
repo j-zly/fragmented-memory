@@ -1001,20 +1001,51 @@ class RedisStorage:
         effective_agent_id = agent_id if agent_id else self._agent_id
         effective_is_primary = is_primary if is_primary is not None else self._is_primary
 
-        # 双路融合检索（v1.2）: BM25 全文 + KNN 语义并行，合并去重后返回
-        # BM25 结果在前（关键词精确命中高置信），KNN 补充语义召回
-        results = self.search_bm25(query, tag_filter, effective_agent_id, effective_is_primary)
+        # RRF 融合检索（v1.3）: BM25 + KNN 两路排名融合（Reciprocal Rank Fusion）
+        # 不比较原始分数（量纲不同），只按排名位置加权：score = Σ 1/(k + rank)
+        # 两路都排名高的记忆排最前（交叉验证）；单路时退化为该路自身顺序
+        bm25_results = self.search_bm25(query, tag_filter, effective_agent_id, effective_is_primary)
 
         if self._has_embedder():
             knn_results = self.search_knn(query, tag_filter, effective_agent_id, effective_is_primary)
             if knn_results:
-                seen = {r.get("content") for r in results if r.get("content")}
-                knn_only = [r for r in knn_results if r.get("content") not in seen]
-                if knn_only:
-                    # KNN 补充召回排在 BM25 之后，按 final_limit 截断
-                    results = (results + knn_only)[: self._final_limit]
+                return self._rrf_fuse(bm25_results, knn_results)
 
-        return results
+        return bm25_results
+
+    def _rrf_fuse(
+        self,
+        bm25_results: List[Dict[str, Any]],
+        knn_results: List[Dict[str, Any]],
+        k: int = 60,
+    ) -> List[Dict[str, Any]]:
+        """Reciprocal Rank Fusion：两路检索按排名位置融合，返回 final_limit 条。
+
+        原理：score(content) = 1/(k+BM25排名) + 1/(k+KNN排名)，k 取 60（业界常用）。
+        - 两路都命中 → 分数叠加 → 排最前（交叉验证）
+        - 单路命中 → 得该路排名分
+        - 按 content 去重合并（同一记忆条目只保留一份，字段取先出现者）
+        """
+        scores: dict = {}
+        items: dict = {}
+        for rank, frag in enumerate(bm25_results, 1):
+            c = frag.get("content")
+            if not c:
+                continue
+            scores[c] = scores.get(c, 0.0) + 1.0 / (k + rank)
+            items[c] = frag
+        for rank, frag in enumerate(knn_results, 1):
+            c = frag.get("content")
+            if not c:
+                continue
+            scores[c] = scores.get(c, 0.0) + 1.0 / (k + rank)
+            if c not in items:
+                items[c] = frag
+
+        fused = sorted(items.values(), key=lambda f: -scores[f.get("content")])
+        for frag in fused:
+            frag["_combined_score"] = scores.get(frag.get("content"), 0.0)
+        return fused[: self._final_limit]
 
     # ------------------------------------------------------------------
     # 综合得分重排序
