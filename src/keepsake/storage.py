@@ -13,6 +13,7 @@ import json as _json
 import logging
 import os
 import struct
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -39,6 +40,9 @@ DEFAULT_CANDIDATE_COUNT = 10   # KNN 候选数
 
 # 时间衰减半衰期（天）
 DECAY_HALF_DAYS = 60
+
+# 实体时间线索引（v1.5: 按实体组织的记忆时间线）
+ENTITY_TIMELINE_KEY = "keepsake:entity_timeline"
 
 # embedding 缓存 TTL（秒）
 EMBED_CACHE_TTL = 3600
@@ -501,6 +505,24 @@ class RedisStorage:
             if fragment_type:
                 mapping["fragment_type"] = fragment_type
 
+            # v1.5 版本化: 同内容已存在 → 旧版标记失效（valid_until），新版写入独立 key
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if client.exists(key):
+                client.hset(key, "valid_until", now_iso)
+                client.hset(key, "is_archived", "1")
+                key = f"{key}:{int(time.time())}"
+
+            # v1.5 实体时间线索引: 每个实体一个 ZSET，score=时间戳（供时间线查询）
+            if entities:
+                ts = time.time()
+                try:
+                    pipe = client.pipeline()
+                    for ent in entities:
+                        pipe.zadd(f"{ENTITY_TIMELINE_KEY}:{ent}", {key: ts})
+                    pipe.execute()
+                except Exception:
+                    pass
+
             # embed_bin 可选：有 embedder 时计算并存
             if self._has_embedder():
                 blob = self._text_to_blob(text)
@@ -860,7 +882,7 @@ class RedisStorage:
                 .dialect(2)
                 .return_fields("content", "tags", "category", "source", "created",
                                "sentiment_score", "sentiment_label", "feedback_score",
-                               "invalid_at", "entities")
+                               "invalid_at", "valid_until", "entities")
             )
 
             result = client.ft(RS_INDEX).search(q)
@@ -879,6 +901,10 @@ class RedisStorage:
                 # 跳过已过期的碎片
                 invalid_at = getattr(doc, "invalid_at", None)
                 if invalid_at:
+                    continue
+                # v1.5: 跳过历史版本（valid_until 已设 = 已被新版取代）
+                valid_until = getattr(doc, "valid_until", None)
+                if valid_until:
                     continue
                 if frag.get("content"):
                     # v1.4: 过滤超长噪音条目（背景进程输出/图片描述等长文本 BM25 分虚高）
@@ -949,7 +975,7 @@ class RedisStorage:
                 .sort_by("score")
                 .return_fields("content", "tags", "category", "source", "created",
                                "sentiment_score", "sentiment_label", "feedback_score",
-                               "invalid_at", "entities")
+                               "invalid_at", "valid_until", "entities")
                 .dialect(2)
                 .paging(0, self._candidate_count)
             )
@@ -962,7 +988,7 @@ class RedisStorage:
                 frag: Dict[str, Any] = {}
                 for field in ("content", "tags", "category", "source", "created",
                              "sentiment_score", "sentiment_label", "feedback_score",
-                             "invalid_at", "entities"):
+                             "invalid_at", "valid_until", "entities"):
                     val = getattr(doc, field, None)
                     if val is not None and val != "":
                         if isinstance(val, bytes):
@@ -971,6 +997,9 @@ class RedisStorage:
                 # 跳过已过期的碎片
                 invalid_at = getattr(doc, "invalid_at", None)
                 if invalid_at:
+                    continue
+                # v1.5: 跳过历史版本
+                if getattr(doc, "valid_until", None):
                     continue
                 if frag.get("content"):
                     frag["_knn_score"] = float(getattr(doc, "score", 1.0))
@@ -981,6 +1010,36 @@ class RedisStorage:
 
         except Exception as e:
             logger.debug("storage: KNN search error: %s", e)
+            return []
+
+    # ------------------------------------------------------------------
+    # 实体时间线查询（v1.5）— 回答「某实体最近有什么变化」
+    # ------------------------------------------------------------------
+
+    def entity_timeline(self, entity: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """按时间倒序返回某实体的记忆时间线。"""
+        client = self._get_client()
+        if not client or not entity.strip():
+            return []
+        try:
+            keys = client.zrevrange(f"{ENTITY_TIMELINE_KEY}:{entity.strip()}", 0, limit - 1)
+            out: List[Dict[str, Any]] = []
+            for k in keys:
+                if isinstance(k, bytes):
+                    k = k.decode("utf-8")
+                content = client.hget(k, "content")
+                if not content:
+                    continue
+                created = client.hget(k, "created")
+                valid_until = client.hget(k, "valid_until")
+                out.append({
+                    "content": content.decode("utf-8") if isinstance(content, bytes) else content,
+                    "created": created.decode("utf-8") if isinstance(created, bytes) else created,
+                    "valid_until": valid_until.decode("utf-8") if isinstance(valid_until, bytes) else valid_until,
+                })
+            return out
+        except Exception as e:
+            logger.debug("storage: entity_timeline error: %s", e)
             return []
 
     # ------------------------------------------------------------------

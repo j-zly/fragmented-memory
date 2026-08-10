@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import jieba
+import jieba.posseg  # 显式导入（该版本 jieba 无 lazy 加载，否则 posseg.lcut 抛 AttributeError 被吞）
 
 # 自定义领域词典路径（由 discover_synonyms 自动生成）
 _DOMAIN_DICT = Path.home() / '.config' / 'keepsake' / 'jieba_dict.txt'
@@ -330,6 +331,12 @@ def split_text(text: str, max_chars: int = 500) -> List[str]:
 # 大写缩写/英文实体: BTC, ETH, ZG, MACD 等
 _ENTITY_ENGLISH_RE = re.compile(r"[A-Z][A-Z0-9]{1,}(?:/[A-Z0-9]+)*")  # BTC, ETH, ZG, ZD
 
+# v1.5: 英文碎词噪音（jieba 把长英文拆成的片段/常见虚词）
+_ENTITY_ENG_STOP = frozenset({
+    "in", "an", "ce", "be", "dd", "em", "g", "of", "to", "on", "at", "is",
+    "am", "or", "nd", "st", "th", "nt", "ab", "cd", "ef", "gh",
+})
+
 # 中文平台/项目名常见词缀
 _ENTITY_CHN_SUFFIXES = {"公司", "平台", "集团", "科技", "网络", "学院", "大学", "社区", "基金", "项目", "团队", "部门"}
 
@@ -406,16 +413,31 @@ def extract_entities(text: str) -> list[str]:
             w_stripped = w.strip()
             if len(w_stripped) < 2:
                 continue
-            # 人名/机构/地名/专名
-            if flag in ("nr", "nr1", "nr2", "nrj", "nrf", "nt", "ns", "nsf", "nz"):
+            # 人名/机构/地名
+            if flag in ("nr", "nr1", "nr2", "nrj", "nrf", "nt", "ns", "nsf"):
                 key = w_stripped.lower()
                 if key not in seen:
                     entities.append(w_stripped)
                     seen.add(key)
+            # 其他专名（nz）— 只收含中文或首字母大写的英文词
+            # （HMM/领域词典会把英文碎片标 nz，如 Binance→in/an；也会把 Redis 标 nz）
+            elif flag == "nz":
+                is_chinese = bool(re.search(r"[\u4e00-\u9fff]", w_stripped))
+                is_title_eng = (
+                    w_stripped[0].isupper()
+                    and w_stripped.isalnum()
+                    and len(w_stripped) >= 3
+                )
+                if is_chinese or is_title_eng:
+                    key = w_stripped.lower()
+                    if key not in seen:
+                        entities.append(w_stripped)
+                        seen.add(key)
             # 英文词（BTC, ETH 等）
             elif flag == "eng":
                 key = w_stripped.lower()
-                if len(key) >= 2 and key not in seen:
+                # v1.5: 过滤英文碎词噪音（jieba 把长英文拆成 in/an/ce 等）+ 常见虚词
+                if len(key) >= 3 and key not in _ENTITY_ENG_STOP and key not in seen:
                     entities.append(w_stripped.upper())
                     seen.add(key)
     except Exception:
