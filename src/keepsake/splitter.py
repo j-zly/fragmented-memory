@@ -363,7 +363,18 @@ def segment_query(query: str) -> list[str]:
 
     # 中文：jieba 分词
     words = jieba.lcut(query)
-    return [w for w in words if w.strip()]
+    words = [w for w in words if w.strip()]
+
+    # v1.4: 补充完整英文/数字词 — jieba 可能把英文切碎（embedding → em/be/dd/in/g），
+    # 整词追加保证 TAG/entities 精确匹配能命中
+    eng_words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.\-]*", query)
+    lower_set = {w.lower() for w in words}
+    for w in eng_words:
+        if w.lower() not in lower_set:
+            words.append(w)
+            lower_set.add(w.lower())
+
+    return words
 
 
 

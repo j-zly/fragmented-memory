@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 RS_INDEX = "idx:memories"
 
 # BM25 检索参数
-DEFAULT_BM25_LIMIT = 10        # BM25 搜多少条候选
+DEFAULT_BM25_LIMIT = 20        # BM25 搜多少条候选（v1.4: 10→20 减少截断丢失）
 DEFAULT_FINAL_LIMIT = 5        # 最终返回条数
 
 # KNN 参数（embedding 模式用）
@@ -836,7 +836,9 @@ class RedisStorage:
             # entities 字段只搜原始搜索词（不同义词扩展，避免TAG查询长度超限）
             raw_safe = "|".join(_escape_query_term(t) for t in raw_terms)
             entities_q = f"@entities:{{{raw_safe}}}"
-            query_expr = f"({content_q} | {entities_q})"
+            # v1.4: tags 字段也参与检索 — 查询词精确匹配 tag（embedding/lesson 等分类词常在 tags）
+            tags_q = f"@tags:{{{raw_safe}}}"
+            query_expr = f"({content_q} | {entities_q} | {tags_q})"
 
             # 如果不是主脑且指定了 agent_id，则添加 agent 过滤条件
             effective_agent_id = agent_id if agent_id else self._agent_id
@@ -879,6 +881,10 @@ class RedisStorage:
                 if invalid_at:
                     continue
                 if frag.get("content"):
+                    # v1.4: 过滤超长噪音条目（背景进程输出/图片描述等长文本 BM25 分虚高）
+                    # 有效记忆条目通常 <600 字符；超过则视为噪音跳过
+                    if len(frag["content"]) > 600:
+                        continue
                     # BM25 score 越大越相关
                     frag["_bm25_score"] = float(getattr(doc, "score", 0.0))
                     fragments.append(frag)
