@@ -39,6 +39,11 @@
 | 🧬 **多级合并** | 每 2 小时自动将同主题条目合并提炼为高层记忆，支持 level 1→2→3 多级蒸馏 |
 | 🗑️ **选择性遗忘** | 自动清理低价值（旧 + 无反馈 + 低情绪）条目，保持库精简 |
 | ⏰ **定时任务自动注册** | 作为 Hermes 插件使用时，初始化自动注册三条 cron（记忆维护 2h/去重 1h/同义词 8h），零手动配置 |
+| 🔀 **RRF 融合排序（v1.3）** | Reciprocal Rank Fusion 将 BM25 全文 + 语义 KNN 结果融合为单一排序，召回更准 |
+| 💻 **本地语义检索** | 可选 ollama `nomic-embed-text` 嵌入（768 维）完全本地运行，无需外部 Embedding API |
+| ⏱️ **时间感知召回（v1.5）** | 实体时间线（`keepsake:entity_timeline`）+ 事实版本化——搜索不仅看「说了什么」还看「什么时候发生」 |
+| 🧪 **本地记忆提炼** | `scripts/memory_distill.py` 用本地模型（qwen3:8b）把陈旧条目蒸馏为精简摘要，watermark 增量更新（可开关、ComfyUI 错峰） |
+| 📊 **检索质量抽查集** | `scripts/eval_spotcheck.py` 20 条真实查询回归测试持续追踪检索质量（v1.4：60% → 67%） |
 | 🧩 **Hermes 插件壳** | 内含 `hermes-plugin/` 目录（plugin.yaml + __init__.py），即拷即用 |
 
 ## 设计哲学：为 LLM 优化的干净记忆

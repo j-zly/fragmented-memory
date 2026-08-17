@@ -33,12 +33,17 @@ User: "How did we set up that React project structure last time?"
 - **On-Demand Storage** — only `memory(action='add')` stores data; no automatic per-turn archiving
 - **Search-Time Expiry** — `invalid_at` field in index: set a timestamp and the entry is filtered out at search time (no data loss, can be reverted)
 - **Auto Maintenance** — consolidation (keyword clustering + LLM summarization) + selective forgetting (multi-dimension low-value detection) run every 2h to keep storage tidy
+- **RRF Fusion Ranking (v1.3)** — Reciprocal Rank Fusion combines BM25 full-text and semantic KNN results into a single ranked list for better recall
+- **Local Semantic Search** — optional ollama `nomic-embed-text` embedder (768-dim) runs fully on-premise, no external embedding API needed
+- **Time-Aware Recall (v1.5)** — entity timelines (`keepsake:entity_timeline`) + versioned facts let searches leverage *when* things happened, not just what was said
+- **Local Memory Distillation** — `scripts/memory_distill.py` uses a local model (qwen3:8b) to distill stale entries into compact summaries with watermark incremental updates (toggleable, ComfyUI off-peak aware)
+- **Retrieval Quality Spot Checks** — `scripts/eval_spotcheck.py` runs 20 real-query regression tests to track search quality (v1.4: 60% → 67%)
 - **Auto-Registered Cron Jobs** — when used as a Hermes plugin, three cron jobs (memory maintenance every 2h, deduplication every 1h, synonym discovery every 8h) are automatically registered on plugin initialization — zero manual setup
 - **Hermes Plugin Wrapper** — ready-to-use `hermes-plugin/` directory with `plugin.yaml` and `__init__.py` for drop-in installation
 
 ## Design Philosophy: Clean Memory for LLMs
 
-Keepsake stores **full, self-contained entries** — not entryed conversation snippets. The key insight is that LLMs need complete context to make use of stored information. A entry like "prefers TypeScript + Vite" without its surrounding context is useless; the full entry "User prefers TypeScript + Vite for frontend projects" is immediately actionable.
+Keepsake stores **full, self-contained entries** — not split conversation snippets. The key insight is that LLMs need complete context to make use of stored information. An entry like "prefers TypeScript + Vite" without its surrounding context is useless; the full entry "User prefers TypeScript + Vite for frontend projects" is immediately actionable.
 
 | Mechanism | Implementation |
 |-----------|---------------|
