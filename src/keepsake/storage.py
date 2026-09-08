@@ -158,6 +158,7 @@ class RedisStorage:
         synonym_min_co_occurrence: int = 3,
         entity_cooc_top_n: int = 3,
         entity_cooc_min_count: int = 2,
+        v2_min_score: float = 0.05,
     ):
         self._embedder = embedder
         # 加固: embedder 存在时优先用它的真实维度，防止调用方漏传 embed_dim 建错索引
@@ -192,6 +193,8 @@ class RedisStorage:
         # 实体共现参数
         self._entity_cooc_top_n = entity_cooc_top_n
         self._entity_cooc_min_count = entity_cooc_min_count
+        # v2 检索侧：注入相似度地板（按 _sim 归一化值）
+        self._v2_min_score = float(v2_min_score)
         # 使用连接池（所有实例共享）
         self._pool: Optional[redis.ConnectionPool] = None
         self._client: Optional[redis.Redis] = None
@@ -578,6 +581,87 @@ class RedisStorage:
         return count
 
     # ------------------------------------------------------------------
+    # v2 两相管线辅助 — 单碎片读写 + 封边
+    # ------------------------------------------------------------------
+
+    def get_fragment(self, key: str) -> Optional[Dict[str, Any]]:
+        """读一个碎片的完整 hash（v2 pipeline UPDATE 阶段需要看旧事实全文）。
+
+        返回所有字段已 bytes → str 解码；key 不存在或 Redis 不可用返回 None。
+        非破坏性新增，不改既有方法签名。
+        """
+        if not key:
+            return None
+        client = self._get_client()
+        if not client:
+            return None
+        try:
+            raw = client.hgetall(key)
+            if not raw:
+                return None
+            out: Dict[str, Any] = {}
+            for k_b, v_b in raw.items():
+                k = k_b.decode("utf-8") if isinstance(k_b, bytes) else k_b
+                v = v_b.decode("utf-8") if isinstance(v_b, bytes) else v_b
+                out[k] = v
+            return out
+        except Exception as e:
+            logger.debug("storage: get_fragment error for %s: %s", key, e)
+            return None
+
+    def get_fragments_batch(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
+        """批量读碎片 hash（pipeline 在封边前批量校验候选 key 是否已被封）。
+
+        返回 {key: fragment_dict}；缺失或读取失败的 key 不出现在结果里。
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        if not keys:
+            return out
+        client = self._get_client()
+        if not client:
+            return out
+        try:
+            pipe = client.pipeline()
+            for k in keys:
+                pipe.hgetall(k)
+            results = pipe.execute()
+            for key, raw in zip(keys, results):
+                if not raw:
+                    continue
+                doc: Dict[str, Any] = {}
+                for k_b, v_b in raw.items():
+                    kk = k_b.decode("utf-8") if isinstance(k_b, bytes) else k_b
+                    vv = v_b.decode("utf-8") if isinstance(v_b, bytes) else v_b
+                    doc[kk] = vv
+                out[key] = doc
+        except Exception as e:
+            logger.debug("storage: get_fragments_batch error: %s", e)
+        return out
+
+    def supersede_fragment(self, old_key: str, new_key: str) -> bool:
+        """封边：把 old_key 标 superseded_by=new_key + superseded_at=now。
+
+        旧碎片不物理删；检索/注入路径会自动排除（fragment_type!="consumed" 但
+        superseded_by 非空也算被取代）。new_key='__void__' 用于 DELETE 路径
+        （旧记忆矛盾但不留新事实）。
+        """
+        if not old_key:
+            return False
+        client = self._get_client()
+        if not client:
+            return False
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            pipe = client.pipeline()
+            pipe.hset(old_key, "superseded_by", new_key or "__void__")
+            pipe.hset(old_key, "superseded_at", now)
+            pipe.execute()
+            return True
+        except Exception as e:
+            logger.warning("storage: supersede_fragment %s→%s failed: %s", old_key, new_key, e)
+            return False
+
+    # ------------------------------------------------------------------
     # 热门话题统计
     # ------------------------------------------------------------------
 
@@ -880,9 +964,11 @@ class RedisStorage:
                 Query(query_expr)
                 .paging(0, self._bm25_limit)
                 .dialect(2)
+                # v2: 加 fragment_type 让消费侧可剔除已 consumed 碎片；__key 让消费侧能批量读 superseded_by
                 .return_fields("content", "tags", "category", "source", "created",
                                "sentiment_score", "sentiment_label", "feedback_score",
-                               "invalid_at", "valid_until", "entities")
+                               "invalid_at", "valid_until", "entities",
+                               "fragment_type", "__key")
             )
 
             result = client.ft(RS_INDEX).search(q)
@@ -892,12 +978,18 @@ class RedisStorage:
                 frag: Dict[str, Any] = {}
                 for field in ("content", "tags", "category", "source", "created",
                              "sentiment_score", "sentiment_label", "feedback_score",
-                             "invalid_at", "entities"):
+                             "invalid_at", "entities", "fragment_type"):
                     val = getattr(doc, field, None)
                     if val is not None and val != "":
                         if isinstance(val, bytes):
                             val = val.decode("utf-8")
                         frag[field] = val
+                # v2: 记录 Redis key，让消费侧（prefetch / pipeline）能 hget superseded_by 字段
+                doc_key = getattr(doc, "id", None) or getattr(doc, "__key", None)
+                if doc_key:
+                    if isinstance(doc_key, bytes):
+                        doc_key = doc_key.decode("utf-8")
+                    frag["_key"] = doc_key
                 # 跳过已过期的碎片
                 invalid_at = getattr(doc, "invalid_at", None)
                 if invalid_at:
@@ -975,7 +1067,8 @@ class RedisStorage:
                 .sort_by("score")
                 .return_fields("content", "tags", "category", "source", "created",
                                "sentiment_score", "sentiment_label", "feedback_score",
-                               "invalid_at", "valid_until", "entities")
+                               "invalid_at", "valid_until", "entities",
+                               "fragment_type", "__key")
                 .dialect(2)
                 .paging(0, self._candidate_count)
             )
@@ -988,12 +1081,18 @@ class RedisStorage:
                 frag: Dict[str, Any] = {}
                 for field in ("content", "tags", "category", "source", "created",
                              "sentiment_score", "sentiment_label", "feedback_score",
-                             "invalid_at", "valid_until", "entities"):
+                             "invalid_at", "valid_until", "entities", "fragment_type"):
                     val = getattr(doc, field, None)
                     if val is not None and val != "":
                         if isinstance(val, bytes):
                             val = val.decode("utf-8")
                         frag[field] = val
+                # v2: 记录 Redis key（同 BM25 路径）
+                doc_key = getattr(doc, "id", None) or getattr(doc, "__key", None)
+                if doc_key:
+                    if isinstance(doc_key, bytes):
+                        doc_key = doc_key.decode("utf-8")
+                    frag["_key"] = doc_key
                 # 跳过已过期的碎片
                 invalid_at = getattr(doc, "invalid_at", None)
                 if invalid_at:
@@ -1060,6 +1159,11 @@ class RedisStorage:
           2. 如果 BM25 无结果 且 embedder 可用，走 KNN 向量搜索
           3. BM25 有结果则直接返回，不做合并
 
+        v2 后置过滤（2026-09）：
+          - 排除 fragment_type == "consumed"（被 consolidator 吞掉的蒸馏原料）
+          - 排除 superseded_by 非空（被 pipeline UPDATE 阶段封边的旧事实）
+          - 应用 min_score 地板（默认 0.05，按 _sim 即归一化相似度）
+
         如果是主脑（is_primary=True），不限制搜索范围，否则只搜索指定 agent 或 shared 标签的碎片。
         """
         # 如果传入了参数，则优先使用参数；否则使用类实例中的配置
@@ -1074,9 +1178,76 @@ class RedisStorage:
         if self._has_embedder():
             knn_results = self.search_knn(query, tag_filter, effective_agent_id, effective_is_primary)
             if knn_results:
-                return self._rrf_fuse(bm25_results, knn_results)
+                fused = self._rrf_fuse(bm25_results, knn_results)
+                return self._apply_v2_filters(fused)
 
-        return bm25_results
+        return self._apply_v2_filters(bm25_results)
+
+    def _apply_v2_filters(
+        self,
+        fragments: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """v2 后置过滤：剔除 consumed + superseded；可选 min_score 地板。
+
+        设计点：
+          1. fragment_type == "consumed" 由 search_bm25 直接 skip；这里再兜一次（防止
+             pipeline 后续路径绕过 search_bm25）
+          2. superseded_by 非空 → 封边的旧事实，剔除（封边 ≠ 物理删）
+          3. min_score 地板：sim 阈值 = self._v2_min_score（默认 0.05）。
+             这是经验值——实测 prefetch 注入路径下，sim≈0 的碎片大多是噪音或历史
+             版本被错误召回的结果；0.05 兜底后仅剔除明显无关项，不影响 top-K 命中。
+
+        只读 fragment_type / _key 这两个 search_bm25 已返回的字段；superseded_by
+        通过 _key 批量 hget（v2 之前 schema 不含此字段，不进 RediSearch 索引）。
+        """
+        if not fragments:
+            return fragments
+
+        # 第一道：fragment_type（已有）+ 长度（保持兼容）
+        after_type: List[Dict[str, Any]] = []
+        for f in fragments:
+            if f.get("fragment_type") == "consumed":
+                continue
+            after_type.append(f)
+
+        # 第二道：批量查 superseded_by（pipeline 写入但 schema 未建索引）
+        keys = [f.get("_key") for f in after_type if f.get("_key")]
+        superseded_map: Dict[str, str] = {}
+        if keys:
+            try:
+                client = self._get_client()
+                if client:
+                    pipe = client.pipeline()
+                    for k in keys:
+                        pipe.hget(k, "superseded_by")
+                    raw_vals = pipe.execute()
+                    for k, v in zip(keys, raw_vals):
+                        if v is None:
+                            continue
+                        val = v.decode("utf-8") if isinstance(v, bytes) else v
+                        if val:
+                            superseded_map[k] = val
+            except Exception as e:
+                logger.debug("storage: v2 superseded_by batch read failed: %s", e)
+
+        after_super: List[Dict[str, Any]] = []
+        for f in after_type:
+            k = f.get("_key")
+            if k and k in superseded_map:
+                continue
+            after_super.append(f)
+
+        # 第三道：min_score 地板
+        floor = getattr(self, "_v2_min_score", 0.05)
+        if floor and floor > 0:
+            kept: List[Dict[str, Any]] = []
+            for f in after_super:
+                sim = float(f.get("_sim", 0.0) or 0.0)
+                if sim < floor:
+                    continue
+                kept.append(f)
+            return kept
+        return after_super
 
     def _rrf_fuse(
         self,

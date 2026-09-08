@@ -40,6 +40,8 @@ from .embedder import create_embedder
 from .storage import RedisStorage
 from .consolidator import Consolidator
 from .forgetter import Forgetter
+# v2（2026-09）：写侧两相管线（Mem0 风格 + 封边取代）
+from .pipeline import Pipeline, DEFAULT_PIPELINE_CONFIG as _LLM_PIPELINE_DEFAULTS
 
 # ---------------------------------------------------------------------------
 # 工具扇区（供 Hermes MemoryProvider 注册）
@@ -201,6 +203,10 @@ class KeepsakeProvider(MemoryProvider):
             "entity_cooc_min_count": 2,
             # 写闸门 v1（2026-09）：enabled 默认开、max_len 默认 2000
             "ingest_gate": {"enabled": True, "max_len": 2000},
+            # v2 写侧两相管线（2026-09）：默认开启，缺 LLM 时自动回落 v1
+            "llm_pipeline": dict(_LLM_PIPELINE_DEFAULTS),
+            # v2 检索侧相似度地板（按 _sim 归一化）
+            "v2_min_score": 0.05,
         }
 
         # 2. JSON 配置文件覆盖
@@ -356,6 +362,8 @@ class KeepsakeProvider(MemoryProvider):
             synonym_min_co_occurrence=int(cfg.get("synonym_min_co_occurrence", 3)),
             entity_cooc_top_n=int(cfg.get("entity_cooc_top_n", 3)),
             entity_cooc_min_count=int(cfg.get("entity_cooc_min_count", 2)),
+            # v2（2026-09）：检索侧相似度地板，按 _sim 归一化值过滤
+            v2_min_score=float(cfg.get("v2_min_score", 0.05)),
         )
 
         # 自动创建/验证 index
@@ -391,6 +399,9 @@ class KeepsakeProvider(MemoryProvider):
             dry_run=bool(cfg.get("forget_dry_run", True)),
         )
         logger.info("keepsake: maintenance engines initialized")
+
+        # v2（2026-09）：写侧两相管线 — 仅在 enabled 且有 LLM 时启动
+        self._init_pipeline(cfg.get("llm_pipeline", {}) or {})
 
         # 自动注册定时任务（仅在首次启动时创建）
         self._ensure_cron_jobs()
@@ -584,12 +595,34 @@ class KeepsakeProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """每轮对话结束后自动存储用户消息到记忆库。"""
+        """v2（2026-09）：格式闸门 → v2 pipeline 入队 → 兜底 v1 decide() 直存。"""
         if not self._storage or not user_content or not user_content.strip():
             return
         text = user_content.strip()
-        # 写闸门：R1-R7 顺序短路裁决（ingest_gate v1，2026-09）
-        from .ingest_gate import decide, update_state_only
+        decision, existing_meta = self._gate_decide(text, "turn_memory")
+        if decision.action == "reject":
+            return
+        pipeline = getattr(self, "_pipeline", None)
+        if pipeline is not None and getattr(pipeline, "_llm_fn", None) is not None:
+            try:
+                pipeline.enqueue(text, assistant_content or "")
+                return
+            except Exception as e:
+                logger.warning("keepsake: pipeline.enqueue failed (%s); falling back to v1", e)
+        self._v1_store_after_decide(text, decision, existing_meta, "turn_memory", "hermes_agent", "")
+
+    def _v1_fallback_store(self, user_text: str, category: str = "turn_memory") -> None:
+        """v2 pipeline 失败时的窗口级兜底（与 sync_turn 的 v1 路径同源）。"""
+        if not self._storage or not user_text or not user_text.strip():
+            return
+        decision, existing_meta = self._gate_decide(user_text.strip(), category)
+        if decision.action == "reject":
+            return
+        self._v1_store_after_decide(user_text.strip(), decision, existing_meta, category, "pipeline_v2_fallback", "fallback:v1")
+
+    def _gate_decide(self, text: str, category: str):
+        """R1-R7 闸门裁决 + 探测同 hash 既有 meta（v1 与 v2 共享）。"""
+        from .ingest_gate import decide
         frag_key = f"memory:frag:{hashlib.sha256(text.encode()).hexdigest()[:12]}"
         existing_meta = None
         try:
@@ -598,22 +631,42 @@ class KeepsakeProvider(MemoryProvider):
                 existing_meta = {"key": frag_key}
         except Exception:
             pass
-        decision = decide(text, "turn_memory", existing_meta, getattr(self, "_gate_cfg", None))
-        if decision.action == "reject":
-            return
+        return decide(text, category, existing_meta, getattr(self, "_gate_cfg", None)), existing_meta
+
+    def _v1_store_after_decide(self, text, decision, existing_meta, category, source, extra_tags) -> None:
+        """decide() 之后直存（含 update_state 闭环；v1 与 v2 兜底共享）。"""
+        from .ingest_gate import update_state_only
         if decision.action == "update_state":
             update_state_only(self._storage, existing_meta)
             return
         try:
-            self._storage.store(
-                text=text,
-                tags="conversation",
-                category="turn_memory",
-                source="hermes_agent",
-                fragment_type="memory",
-            )
+            tags = "conversation" + ("," + extra_tags if extra_tags else "")
+            self._storage.store(text=text, tags=tags, category=category, source=source,
+                                fragment_type="memory")
         except Exception as e:
-            logger.warning("keepsake: sync_turn store failed: %s", e)
+            logger.warning("keepsake: _v1_store_after_decide failed: %s", e)
+
+    def _init_pipeline(self, llm_pipe_cfg: dict) -> None:
+        """v2（2026-09）：构建 Pipeline 实例并启动 daemon（LLM 不可用则跳过）。"""
+        self._pipeline = None
+        if not llm_pipe_cfg.get("enabled", True):
+            return
+        from .consolidator import _call_llm, _get_api_key
+        if not _get_api_key():
+            logger.warning("keepsake: v2 pipeline disabled (no LLM API key); falls back to v1")
+            return
+        self._pipeline = Pipeline(
+            storage=self._storage, llm_fn=_call_llm,
+            model=llm_pipe_cfg.get("model") or "qwen-plus",
+            window_pairs=int(llm_pipe_cfg.get("window_pairs", 4)),
+            window_seconds=float(llm_pipe_cfg.get("window_seconds", 30.0)),
+            max_calls_per_window=int(llm_pipe_cfg.get("max_calls_per_window", 8)),
+            update_top_k=int(llm_pipe_cfg.get("update_top_k", 5)),
+            recent_context_size=int(llm_pipe_cfg.get("recent_context_size", 8)),
+            gate_fallback=self._v1_fallback_store,
+        )
+        self._pipeline.start()
+        logger.info("keepsake: v2 pipeline started")
 
     def _maybe_maintain(self) -> None:
         """检查是否该执行维护，执行 Consolidation + Forget。"""
@@ -702,6 +755,13 @@ class KeepsakeProvider(MemoryProvider):
         return _json.dumps({"topics": topics, "count": len(topics)}, ensure_ascii=False)
 
     def shutdown(self) -> None:
+        # v2（2026-09）：先排空管线，再关 storage；保证 shutdown 前队列内消息不丢
+        pipeline = getattr(self, "_pipeline", None)
+        if pipeline is not None:
+            try:
+                pipeline.stop(drain=True, timeout=5.0)
+            except Exception as e:
+                logger.warning("keepsake: pipeline stop failed: %s", e)
         if self._storage:
             self._storage.close()
         logger.info("keepsake memory provider shutdown")

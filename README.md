@@ -40,6 +40,7 @@ User: "How did we set up that React project structure last time?"
 - **Retrieval Quality Spot Checks** — `scripts/eval_spotcheck.py` runs 20 real-query regression tests to track search quality (v1.4: 60% → 67%)
 - **Auto-Registered Cron Jobs** — when used as a Hermes plugin, three cron jobs (memory maintenance every 2h, deduplication every 1h, synonym discovery every 8h) are automatically registered on plugin initialization — zero manual setup
 - **Hermes Plugin Wrapper** — ready-to-use `hermes-plugin/` directory with `plugin.yaml` and `__init__.py` for drop-in installation
+- **Two-Phase Pipeline (v2, 2026-09)** — Mem0-style extract/update phases run async on a daemon thread, sealing old facts via `superseded_by` edges (not physical delete) so stale snapshots (e.g. completed tasks marked pending) never reappear. Cost-capped at `llm_pipeline.max_calls_per_window`; any LLM/JSON failure or budget breach falls back to v1 rule-gate storage — messages are never silently dropped.
 
 ## Design Philosophy: Clean Memory for LLMs
 
@@ -383,6 +384,10 @@ keepsake/
 ```
 
 The three cron jobs in `cron/` are **auto-registered** when the keepsake plugin initializes (on `/new` or gateway restart). No manual `hermes cron create` needed.
+
+## v2 Two-Phase Pipeline (2026-09)
+
+每轮对话走两相 LLM：**提取相**从窗口提炼长期事实（废话/纯确认自然无事实可提而消亡），**更新相**对每条 fact 拿 top-5 相似旧记忆做 ADD / UPDATE / DELETE / NOOP —— UPDATE/DELETE 给旧碎片只打 `superseded_by` 封边不物理删，检索侧统一排除；窗口内 LLM 调用硬顶 `llm_pipeline.max_calls_per_window`（默认 8），任一 LLM/JSON 失败或超预算 → 窗口整体回落 v1 规则闸门直存原文，**绝不静默丢消息**。配置键：`llm_pipeline.{enabled, model, window_pairs, window_seconds, max_calls_per_window, update_top_k, recent_context_size}`、`v2_min_score`。
 
 ## Architecture
 
