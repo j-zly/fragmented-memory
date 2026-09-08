@@ -16,6 +16,7 @@ keepsake — Keepsake记忆系统 for Hermes Agent.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -24,8 +25,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
-from tools.registry import tool_error
+try:
+    from agent.memory_provider import MemoryProvider
+    from tools.registry import tool_error
+except ImportError:  # 独立测试环境回退；Hermes 实际运行时从 agent 包导入
+    class MemoryProvider:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def tool_error(msg):
+        return f"[tool_error] {msg}"
 
 from .embedder import create_embedder
 from .storage import RedisStorage
@@ -190,6 +199,8 @@ class KeepsakeProvider(MemoryProvider):
             "synonym_min_co_occurrence": 3,
             "entity_cooc_top_n": 3,
             "entity_cooc_min_count": 2,
+            # 写闸门 v1（2026-09）：enabled 默认开、max_len 默认 2000
+            "ingest_gate": {"enabled": True, "max_len": 2000},
         }
 
         # 2. JSON 配置文件覆盖
@@ -364,6 +375,9 @@ class KeepsakeProvider(MemoryProvider):
         # 初始化 skip patterns 配置
         self._skip_min_length = cfg.get("skip_min_length", 2)
         self._skip_patterns = cfg.get("skip_patterns", set())
+
+        # 写闸门配置（ingest_gate v1，2026-09）
+        self._gate_cfg = cfg.get("ingest_gate", {"enabled": True, "max_len": 2000})
 
         # 初始化 Consolidator 和 Forgetter（守护模式）
         self._consolidator = Consolidator(
@@ -573,9 +587,26 @@ class KeepsakeProvider(MemoryProvider):
         """每轮对话结束后自动存储用户消息到记忆库。"""
         if not self._storage or not user_content or not user_content.strip():
             return
+        text = user_content.strip()
+        # 写闸门：R1-R7 顺序短路裁决（ingest_gate v1，2026-09）
+        from .ingest_gate import decide, update_state_only
+        frag_key = f"memory:frag:{hashlib.sha256(text.encode()).hexdigest()[:12]}"
+        existing_meta = None
+        try:
+            client = self._storage._get_client()
+            if client and client.exists(frag_key):
+                existing_meta = {"key": frag_key}
+        except Exception:
+            pass
+        decision = decide(text, "turn_memory", existing_meta, getattr(self, "_gate_cfg", None))
+        if decision.action == "reject":
+            return
+        if decision.action == "update_state":
+            update_state_only(self._storage, existing_meta)
+            return
         try:
             self._storage.store(
-                text=user_content.strip(),
+                text=text,
                 tags="conversation",
                 category="turn_memory",
                 source="hermes_agent",
@@ -682,15 +713,10 @@ class KeepsakeProvider(MemoryProvider):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """builtin memory 写入时同步存到碎片库（完整内容，不做切分）。"""
-        if action != "add" or not content or not self._storage:
-            return
+        """builtin memory 写入时同步存到碎片库（完整内容，不做切分）。
 
-        raw_text = content.strip()
-        self._storage.store(
-            text=raw_text,
-            tags=target,
-            category="memory_tool",
-            source="hermes_agent",
-            fragment_type="memory",
-        )
+        2026-09 ingest_gate v1：MEMORY.md 与碎片库分离，关闭同步双份入库。
+        保留方法签名（Hermes MemoryProvider ABC 要求）。
+        """
+        # → ingest_gate R5（builtin_dup）：两套体系分离，不再复制 MEMORY.md 进碎片库
+        return

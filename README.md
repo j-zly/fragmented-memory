@@ -348,6 +348,10 @@ redis-cli HSET keepsake:synonyms setup '["install","configure","deploy","setup"]
 redis-cli HSET keepsake:synonyms fix '["fix","modify","correct","repair","solve"]'
 ```
 
+### Ingest Gate v1 (2026-09)
+
+Write-side gate (`src/keepsake/ingest_gate.py`) intercepts every `sync_turn()` call before storage. Rules short-circuit in order: **R1** `[CONTEXT COMPACTION` prefix → reject; **R2** `len > max_len` (default 2000) → reject; **R3** blacklist / status questions / stripped length < 8 → reject; **R4** no letter/Chinese/digit at all → reject; **R5** `category="memory_tool"` → reject (MEMORY.md ↔ fragment library decoupled); **R6** same content hash already exists for `turn_memory`/`conversation` → `update_state` only (bump `updated_at`/`touch_count`, never overwrite `content`); **R7** else → store. Toggle in `config.json` under `"ingest_gate": {"enabled": true, "max_len": 2000}`. Defaults: enabled.
+
 ## Verification
 
 Check logs after startup:
