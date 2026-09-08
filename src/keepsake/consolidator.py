@@ -78,17 +78,105 @@ def _get_api_key() -> str:
     return key
 
 
-def _call_llm(messages: List[Dict[str, str]], model: str = DEFAULT_LLM_MODEL,
-              max_retries: int = 2) -> Optional[str]:
-    """调用 DashScope chat API 获取 LLM 回复。带重试。"""
-    api_key = _get_api_key()
+def resolve_llm_channel(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """解析 LLM 通道配置 —— base_url / model / api_key。
+
+    优先级（高→低）:
+      1. `cfg["llm"]` 节存在 → 取 base_url / model / api_key（直填优先）或 key_file（读文件）
+      2. 无 `llm` 节或字段缺失 → 缺省回落现有 dashscope 路径（DASHSCOPE_BASE + DEFAULT_LLM_MODEL + _get_api_key）
+      3. key_file 读失败 → 视同无 key，回落 _get_api_key（不抛）
+
+    返回 dict 字段: base_url, model, api_key, source, key_file。
+    日志安全：logger 只允许出现 key_file 路径 / 端点 host，绝不打印 key 内容。
+    """
+    llm_cfg: Dict[str, Any] = {}
+    if cfg and isinstance(cfg, dict):
+        llm_cfg = cfg.get("llm") or {}
+        if not isinstance(llm_cfg, dict):
+            llm_cfg = {}
+
+    # 0. 缺省回落：dashscope 现状 —— 零配置=原样，行为向后兼容
+    if not llm_cfg:
+        return {
+            "base_url": DASHSCOPE_BASE,
+            "model": DEFAULT_LLM_MODEL,
+            "api_key": _get_api_key(),
+            "source": "dashscope_legacy",
+            "key_file": "",
+        }
+
+    # 1. base_url —— rstrip("/") 防用户手抖
+    base_url = (llm_cfg.get("base_url") or DASHSCOPE_BASE).rstrip("/")
+
+    # 2. model —— 缺省用模块常量，缺省语义保持 qwen-plus
+    model = (llm_cfg.get("model") or DEFAULT_LLM_MODEL).strip()
+
+    # 3. api_key：api_key 直填 > key_file 读取 > _get_api_key() 兜底链
+    api_key = (llm_cfg.get("api_key") or "").strip()
+    key_file_path = llm_cfg.get("key_file") or ""
+    if not api_key and key_file_path:
+        try:
+            with open(key_file_path) as f:
+                api_key = f.read().strip()
+            # 仅打印路径（host 等价信息），绝不打印 key 内容
+            logger.debug(
+                "resolve_llm_channel: loaded key_file=%s (len=%d)",
+                key_file_path, len(api_key),
+            )
+        except (OSError, IOError) as e:
+            # 读文件失败 → 视同无 key，走原回落链，不抛
+            logger.debug(
+                "resolve_llm_channel: key_file=%s unreadable: %s — fallback",
+                key_file_path, e,
+            )
+            api_key = ""
     if not api_key:
-        logger.warning("consolidator: no API key for LLM calls")
+        # 最后兜底：原 hermes/env 链（dashscope 等）
+        api_key = _get_api_key()
+
+    # 4. source 仅用于日志/监控归类（不影响行为）
+    source = "configured"
+    if "bigmodel.cn" in base_url:
+        source = "bigmodel"
+    elif "dashscope" in base_url:
+        source = "dashscope"
+    elif "openai.com" in base_url:
+        source = "openai"
+
+    return {
+        "base_url": base_url,
+        "model": model,
+        "api_key": api_key,
+        "source": source,
+        "key_file": key_file_path,
+    }
+
+
+def _call_llm(messages: List[Dict[str, str]], model: str = DEFAULT_LLM_MODEL,
+              *, channel: Optional[Dict[str, Any]] = None,
+              max_retries: int = 2) -> Optional[str]:
+    """调用 chat API 获取 LLM 回复。带重试。
+
+    channel: 由 resolve_llm_channel 解析出的通道字典（含 base_url/model/api_key）；
+             None → 走 dashscope 兜底链（向后兼容）。
+    channel['model'] 优先于入参 model；二者都不存在时用 DEFAULT_LLM_MODEL。
+    """
+    if channel is None:
+        channel = resolve_llm_channel(None)
+
+    api_key = channel.get("api_key", "")
+    if not api_key:
+        logger.warning(
+            "consolidator: no API key for LLM calls (source=%s)",
+            channel.get("source", "?"),
+        )
         return None
 
-    url = f"{DASHSCOPE_BASE}/chat/completions"
+    base_url = channel["base_url"]
+    actual_model = channel.get("model") or model or DEFAULT_LLM_MODEL
+    url = f"{base_url}/chat/completions"
     payload = json.dumps({
-        "model": model,
+        "model": actual_model,
         "messages": messages,
         "max_tokens": 512,
         "temperature": 0.3,
@@ -136,12 +224,15 @@ class Consolidator:
         max_age_hours: int = DEFAULT_MAX_AGE_HOURS,
         llm_model: str = DEFAULT_LLM_MODEL,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        channel: Optional[Dict[str, Any]] = None,
     ):
         self._storage = storage
         self._min_group_size = min_group_size
         self._max_age_hours = max_age_hours
         self._llm_model = llm_model
         self._batch_size = batch_size
+        # channel：可选 resolve_llm_channel 输出；None → _call_llm 内部兜底
+        self._channel = channel
 
     def consolidate(self) -> Dict[str, Any]:
         """执行一轮碎片合并。返回操作统计。"""
@@ -338,7 +429,7 @@ class Consolidator:
         result = _call_llm([
             {"role": "system", "content": "你是一位知识提炼专家，擅长从对话中提取核心信息。"},
             {"role": "user", "content": prompt},
-        ], model=self._llm_model)
+        ], model=self._llm_model, channel=self._channel)
 
         if not result:
             return False

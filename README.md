@@ -144,7 +144,12 @@ Here's a comprehensive example of the configuration file `~/.config/keepsake/con
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "model": "text-embedding-v2"
   },
-  
+
+  // LLM channel (consolidator + v2 pipeline) — empty = dashscope fallback
+  // base_url: chat completions endpoint root (no trailing /v1 for zhipu etc.)
+  // model: e.g. glm-4-flash, qwen-plus. api_key (testing) OR key_file (prod)
+  "llm": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash", "key_file": "/path/to/key.pass"},
+
   // Auto maintenance
   "consolidate_min_group": 2,
   "consolidate_max_age_hours": 72,

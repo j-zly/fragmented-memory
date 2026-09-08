@@ -207,6 +207,8 @@ class KeepsakeProvider(MemoryProvider):
             "llm_pipeline": dict(_LLM_PIPELINE_DEFAULTS),
             # v2 检索侧相似度地板（按 _sim 归一化）
             "v2_min_score": 0.05,
+            # LLM 通道配置（2026-09）：base_url/model/key_file/api_key；空节=回落 dashscope
+            "llm": {},
         }
 
         # 2. JSON 配置文件覆盖
@@ -387,11 +389,17 @@ class KeepsakeProvider(MemoryProvider):
         # 写闸门配置（ingest_gate v1，2026-09）
         self._gate_cfg = cfg.get("ingest_gate", {"enabled": True, "max_len": 2000})
 
+        # 解析 LLM 通道（base_url/model/api_key）—— 零配置回落 dashscope
+        from .consolidator import resolve_llm_channel as _resolve_llm_channel
+        llm_channel = _resolve_llm_channel(cfg)
+
         # 初始化 Consolidator 和 Forgetter（守护模式）
         self._consolidator = Consolidator(
             storage=self._storage,
             min_group_size=int(cfg.get("consolidate_min_group", 2)),
             max_age_hours=int(cfg.get("consolidate_max_age_hours", 72)),
+            llm_model=llm_channel.get("model") or "qwen-plus",
+            channel=llm_channel,
         )
         self._forgetter = Forgetter(
             storage=self._storage,
@@ -651,13 +659,18 @@ class KeepsakeProvider(MemoryProvider):
         self._pipeline = None
         if not llm_pipe_cfg.get("enabled", True):
             return
-        from .consolidator import _call_llm, _get_api_key
-        if not _get_api_key():
+        from .consolidator import _call_llm, resolve_llm_channel
+        # 复用已经解析过的 channel；缺省回落 dashscope（向后兼容）
+        llm_channel = resolve_llm_channel(self._config)
+        if not llm_channel.get("api_key"):
             logger.warning("keepsake: v2 pipeline disabled (no LLM API key); falls back to v1")
             return
+        # functools.partial 绑定 channel —— llm_fn 仍为 callable，测试 mock 不受影响
+        import functools
+        llm_fn = functools.partial(_call_llm, channel=llm_channel)
         self._pipeline = Pipeline(
-            storage=self._storage, llm_fn=_call_llm,
-            model=llm_pipe_cfg.get("model") or "qwen-plus",
+            storage=self._storage, llm_fn=llm_fn,
+            model=llm_pipe_cfg.get("model") or llm_channel.get("model") or "qwen-plus",
             window_pairs=int(llm_pipe_cfg.get("window_pairs", 4)),
             window_seconds=float(llm_pipe_cfg.get("window_seconds", 30.0)),
             max_calls_per_window=int(llm_pipe_cfg.get("max_calls_per_window", 8)),
